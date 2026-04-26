@@ -87,10 +87,10 @@ With the development server running, call the phone number you purchased in the 
 
 ## Audio Pipeline
 
-Twilio sends PCMU (G.711 μ-law, 8kHz) audio. Gemini Live expects raw PCM (16-bit, little-endian). The server handles transcoding:
+Twilio sends PCMU (G.711 μ-law, 8kHz) audio. Gemini Live expects raw PCM (16-bit, little-endian, 16kHz). The server handles transcoding:
 
-- **Twilio → Gemini**: PCMU 8kHz → `audioop.ulaw2lin` → PCM 8kHz → Gemini (accepts 8kHz natively, resamples to 16kHz internally)
-- **Gemini → Twilio**: PCM 24kHz → `audioop.ratecv` (24→8kHz) → `audioop.lin2ulaw` → PCMU → Twilio
+- **Twilio → Gemini**: PCMU 8kHz → `audioop.ulaw2lin` → PCM 8kHz → `audioop.ratecv` (upsample 8→16kHz) → Gemini
+- **Gemini → Twilio**: PCM 24kHz → struct averaging (downsample 24→8kHz) → `audioop.lin2ulaw` → PCMU → Twilio
 
 ## Interrupt handling / Barge-in
 
