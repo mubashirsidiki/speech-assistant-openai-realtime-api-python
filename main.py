@@ -1,6 +1,7 @@
 import os
 import json
 import base64
+import struct
 import asyncio
 import audioop
 import websockets
@@ -30,17 +31,40 @@ if not GEMINI_API_KEY:
     raise ValueError('Missing the Gemini API key. Please set it in the .env file.')
 
 
-def ulaw_to_pcm_base64(ulaw_b64: str) -> str:
-    """PCMU base64 (8kHz) → PCM16 base64 (8kHz)."""
-    pcm = audioop.ulaw2lin(base64.b64decode(ulaw_b64), 2)
-    return base64.b64encode(pcm).decode('utf-8')
+def ulaw_to_pcm16k_base64(ulaw_b64: str) -> str:
+    """PCMU base64 (8kHz) → PCM16 base64 (16kHz). Upsampled for Gemini."""
+    pcm8 = audioop.ulaw2lin(base64.b64decode(ulaw_b64), 2)
+    pcm16, _ = audioop.ratecv(pcm8, 2, 1, 8000, 16000, None)
+    return base64.b64encode(pcm16).decode('utf-8')
 
 
-def pcm24k_to_ulaw_base64(pcm_b64: str) -> str:
-    """PCM16 base64 (24kHz) → resample 8kHz → PCMU base64."""
-    pcm24 = base64.b64decode(pcm_b64)
-    pcm8, _ = audioop.ratecv(pcm24, 2, 1, 24000, 8000, None)
-    return base64.b64encode(audioop.lin2ulaw(pcm8, 2)).decode('utf-8')
+class OutputAudioConverter:
+    """Stateful 24kHz PCM → 8kHz PCMU converter with buffered alignment."""
+
+    def __init__(self):
+        self._buffer = b''
+
+    def pcm24k_to_ulaw_base64(self, pcm_b64: str) -> str | None:
+        raw = base64.b64decode(pcm_b64)
+        self._buffer += raw
+
+        # Need groups of 3 samples (6 bytes) for 3:1 downsampling
+        n_groups = len(self._buffer) // 6
+        if n_groups == 0:
+            return None
+
+        usable = n_groups * 6
+        samples = struct.unpack_from(f'<{n_groups * 3}h', self._buffer)
+        self._buffer = self._buffer[usable:]
+
+        # Average every 3 samples for 24kHz → 8kHz
+        averages = [
+            (samples[i * 3] + samples[i * 3 + 1] + samples[i * 3 + 2]) // 3
+            for i in range(n_groups)
+        ]
+        downsampled = struct.pack(f'<{n_groups}h', *averages)
+        ulaw = audioop.lin2ulaw(downsampled, 2)
+        return base64.b64encode(ulaw).decode('utf-8')
 
 
 @app.get("/", response_class=JSONResponse)
@@ -54,12 +78,7 @@ async def handle_incoming_call(request: Request):
     response = VoiceResponse()
     # <Say> punctuation to improve text-to-speech flow
     response.say(
-        "Please wait while we connect your call to the A. I. voice assistant, powered by Twilio and the Gemini Live API",
-        voice="Google.en-US-Chirp3-HD-Aoede"
-    )
-    response.pause(length=1)
-    response.say(
-        "O.K. you can start talking!",
+        "Connecting you now.",
         voice="Google.en-US-Chirp3-HD-Aoede"
     )
     host = request.url.hostname
@@ -80,11 +99,19 @@ async def handle_media_stream(websocket: WebSocket):
     ) as gemini_ws:
         await initialize_session(gemini_ws)
 
+        # Have Gemini speak first
+        await gemini_ws.send(json.dumps({
+            "realtimeInput": {
+                "text": "Say hi and ask how you can help. Keep it under 15 words."
+            }
+        }))
+
         # Connection specific state
         stream_sid = None
         latest_media_timestamp = 0
         mark_queue = []
         gemini_transcript = ""
+        output_converter = OutputAudioConverter()
 
         async def receive_from_twilio():
             """Receive audio data from Twilio and send it to Gemini Live."""
@@ -97,8 +124,8 @@ async def handle_media_stream(websocket: WebSocket):
                         await gemini_ws.send(json.dumps({
                             "realtimeInput": {
                                 "audio": {
-                                    "data": ulaw_to_pcm_base64(data['media']['payload']),
-                                    "mimeType": "audio/pcm;rate=8000"
+                                    "data": ulaw_to_pcm16k_base64(data['media']['payload']),
+                                    "mimeType": "audio/pcm;rate=16000"
                                 }
                             }
                         }))
@@ -128,7 +155,9 @@ async def handle_media_stream(websocket: WebSocket):
                         if "modelTurn" in server_content:
                             for part in server_content["modelTurn"].get("parts", []):
                                 if "inlineData" in part:
-                                    audio_b64_ulaw = pcm24k_to_ulaw_base64(part["inlineData"]["data"])
+                                    audio_b64_ulaw = output_converter.pcm24k_to_ulaw_base64(part["inlineData"]["data"])
+                                    if audio_b64_ulaw is None:
+                                        continue
                                     audio_delta = {
                                         "event": "media",
                                         "streamSid": stream_sid,
